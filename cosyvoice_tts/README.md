@@ -13,11 +13,27 @@
 每张卡一个独立 WebSocket 进程，无共享状态，Nginx 负载均衡。
 简单、可靠、低延迟。
 
+## 合成模式
+
+| 模式 | 说明 | 必需参数 |
+|------|------|----------|
+| `zero_shot` | 零样本语音克隆（默认） | `prompt_text` + `prompt_wav` |
+| `clone` | 已注册声音复刻 | `speaker_id` |
+| `cross_lingual` | 跨语言合成 | `prompt_wav` |
+| `instruct` | 指令控制合成 | `instruct_text` + `prompt_wav` |
+
+### 声音复刻流程
+
+```
+1. RegisterSpeaker  →  上传参考音频 + 文本，提取音色并持久化
+2. StartTTS(mode=clone, speaker_id=xxx)  →  用注册的音色合成
+```
+
 ## 文件
 
 ```
 cosyvoice_tts/
-├── server.py     # 单卡 WebSocket TTS 服务
+├── server.py     # 单卡 WebSocket TTS 服务（含声音复刻）
 ├── client.py     # 测试客户端 + 压测工具
 ├── launch.sh     # 多卡一键启动/停止/状态
 └── README.md
