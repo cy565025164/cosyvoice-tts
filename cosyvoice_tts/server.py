@@ -87,15 +87,16 @@ log = logging.getLogger("tts-server")
 # 文本缓冲 & 断句
 # ============================================================
 
-SENTENCE_ENDINGS = set('。！？；\n!?;')
-CLAUSE_ENDINGS = set('，,、：:—…')
-MIN_SENTENCE_LEN = 5
+SENTENCE_ENDINGS = set('。！？!?')
+ALL_PUNCTUATION = set('。！？；，、：:—…!?;,.')
+MIN_SENTENCE_LEN = 10
 MAX_BUFFER_LEN = 100
 
 
 class TextBuffer:
     def __init__(self):
         self._buf = ""
+        self._first_cut = True  # 是否还未完成首次截取
 
     def add(self, text: str) -> list:
         self._buf += text
@@ -111,20 +112,35 @@ class TextBuffer:
         if self._buf.strip():
             sent = self._buf.strip()
             self._buf = ""
+            self._first_cut = True
             return sent
         self._buf = ""
+        self._first_cut = True
         return None
 
     def _try_extract(self):
-        for i, ch in enumerate(self._buf):
-            if ch in SENTENCE_ENDINGS and i + 1 >= MIN_SENTENCE_LEN:
-                sent = self._buf[:i + 1].strip()
-                self._buf = self._buf[i + 1:]
-                if sent:
-                    return sent
+        if self._first_cut:
+            # 首次：长度 > MIN_SENTENCE_LEN 且遇到任意标点即截断
+            for i, ch in enumerate(self._buf):
+                if ch in ALL_PUNCTUATION and i + 1 >= MIN_SENTENCE_LEN:
+                    sent = self._buf[:i + 1].strip()
+                    self._buf = self._buf[i + 1:]
+                    self._first_cut = False
+                    if sent:
+                        return sent
+        else:
+            # 后续：只按句号/问号/感叹号截断
+            for i, ch in enumerate(self._buf):
+                if ch in SENTENCE_ENDINGS:
+                    sent = self._buf[:i + 1].strip()
+                    self._buf = self._buf[i + 1:]
+                    if sent:
+                        return sent
+
+        # 兜底：缓冲区超长时强制截断
         if len(self._buf) > MAX_BUFFER_LEN:
-            for i in range(len(self._buf) - 1, MIN_SENTENCE_LEN - 1, -1):
-                if self._buf[i] in CLAUSE_ENDINGS:
+            for i in range(len(self._buf) - 1, -1, -1):
+                if self._buf[i] in SENTENCE_ENDINGS:
                     sent = self._buf[:i + 1].strip()
                     self._buf = self._buf[i + 1:]
                     if sent:
