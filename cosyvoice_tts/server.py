@@ -90,6 +90,7 @@ log = logging.getLogger("tts-server")
 SENTENCE_ENDINGS = set('。！？!?')
 ALL_PUNCTUATION = set('。！？；，、：:—…!?;,.')
 MIN_SENTENCE_LEN = 10
+MIN_MERGE_LEN = 20
 MAX_BUFFER_LEN = 100
 
 
@@ -130,8 +131,13 @@ class TextBuffer:
                         return sent
         else:
             # 后续：只按句号/问号/感叹号截断
+            # 如果截断后句子 < MIN_MERGE_LEN 字，则与后面的句子拼接
             for i, ch in enumerate(self._buf):
                 if ch in SENTENCE_ENDINGS:
+                    candidate = self._buf[:i + 1].strip()
+                    if candidate and len(candidate) < MIN_MERGE_LEN:
+                        # 太短，继续往后找下一个句号/问号/感叹号
+                        continue
                     sent = self._buf[:i + 1].strip()
                     self._buf = self._buf[i + 1:]
                     if sent:
