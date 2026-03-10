@@ -73,6 +73,7 @@ import uuid
 import threading
 import re
 import struct
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -217,6 +218,56 @@ def preprocess_sentence(text: str):
     if not segments and text.strip():
         segments.append(('text', _APP_RE.sub('A批批', text)))
     return segments
+
+
+# ============================================================
+# PCM 缓存（磁盘）
+# ============================================================
+
+_cache_dir = None          # 初始化时设置
+_cache_lock = threading.Lock()
+
+
+def _cache_key(text: str, mode: str, speaker_id: str) -> str:
+    """基于文本+模式+说话人生成缓存 key（sha256 前16字节hex）"""
+    raw = f"{text}|{mode}|{speaker_id or ''}"
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:32]
+
+
+def _cache_path(key: str) -> str:
+    # 二级子目录防止单目录文件过多: ab/cd/abcd...pcm
+    sub = os.path.join(_cache_dir, key[:2], key[2:4])
+    return os.path.join(sub, key + '.pcm')
+
+
+def cache_get(text: str, mode: str, speaker_id: str):
+    """查缓存，命中返回 bytes，否则 None"""
+    if _cache_dir is None:
+        return None
+    key = _cache_key(text, mode, speaker_id)
+    path = _cache_path(key)
+    if os.path.exists(path):
+        try:
+            with open(path, 'rb') as f:
+                return f.read()
+        except Exception:
+            return None
+    return None
+
+
+def cache_put(text: str, mode: str, speaker_id: str, pcm_data: bytes):
+    """写缓存"""
+    if _cache_dir is None:
+        return
+    key = _cache_key(text, mode, speaker_id)
+    path = _cache_path(key)
+    with _cache_lock:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, 'wb') as f:
+                f.write(pcm_data)
+        except Exception as e:
+            log.warning(f"缓存写入失败: {e}")
 
 
 # ============================================================
@@ -429,7 +480,7 @@ class SynthSession:
 # WebSocket 连接处理
 # ============================================================
 
-_stats = {"connections": 0, "total_served": 0, "total_sentences": 0}
+_stats = {"connections": 0, "total_served": 0, "total_sentences": 0, "cache_hits": 0}
 
 
 async def handle_connection(ws):
@@ -653,21 +704,37 @@ async def _synth_worker(ws, conn_id, session: SynthSession):
                         await ws.send(silence_pcm)
                         chunks += 1
                     elif seg_type == 'text' and seg_value.strip():
-                        async with _infer_semaphore:
-                            results = await loop.run_in_executor(
-                                _executor,
-                                do_inference,
-                                seg_value, session.mode,
-                                session.prompt_text, session.prompt_wav,
-                                session.speaker_id, session.instruct_text,
-                                True,
-                            )
-                        for r in results:
-                            if session.cancel_event.is_set():
-                                break
-                            pcm = speech_to_pcm_bytes(r['tts_speech'])
-                            await ws.send(pcm)
+                        # 查缓存
+                        cached = cache_get(seg_value, session.mode,
+                                           session.speaker_id)
+                        if cached:
+                            await ws.send(cached)
                             chunks += 1
+                            _stats["cache_hits"] += 1
+                            log.debug(f"[{conn_id}] cache hit: "
+                                      f"'{seg_value[:20]}'")
+                        else:
+                            async with _infer_semaphore:
+                                results = await loop.run_in_executor(
+                                    _executor,
+                                    do_inference,
+                                    seg_value, session.mode,
+                                    session.prompt_text, session.prompt_wav,
+                                    session.speaker_id, session.instruct_text,
+                                    True,
+                                )
+                            all_pcm = bytearray()
+                            for r in results:
+                                if session.cancel_event.is_set():
+                                    break
+                                pcm = speech_to_pcm_bytes(r['tts_speech'])
+                                all_pcm.extend(pcm)
+                                await ws.send(pcm)
+                                chunks += 1
+                            # 写缓存
+                            if all_pcm and not session.cancel_event.is_set():
+                                cache_put(seg_value, session.mode,
+                                          session.speaker_id, bytes(all_pcm))
 
                 _stats["total_sentences"] += 1
                 log.debug(f"[{conn_id}/{session.session_id}] "
@@ -699,6 +766,7 @@ async def start_health_server(host, port, gpu_id, backend):
                 "connections": _stats["connections"],
                 "total_served": _stats["total_served"],
                 "total_sentences": _stats["total_sentences"],
+                "cache_hits": _stats["cache_hits"],
                 "registered_speakers": list_speakers(),
             })
 
@@ -759,6 +827,8 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", action="store_true", default=True)
     parser.add_argument("--no-warmup", dest="warmup", action="store_false")
     parser.add_argument("--default-prompt-wav", default="./asset/zero_shot_prompt.wav")
+    parser.add_argument("--cache-dir", default="./tts_cache",
+                        help="PCM 缓存目录 (默认: ./tts_cache，设为空禁用)")
 
     args = parser.parse_args()
 
@@ -766,5 +836,15 @@ if __name__ == "__main__":
         args.concurrency = 8 if args.backend == "vllm" else 3
     if args.health_port is None:
         args.health_port = args.port + 1000
+
+    # 初始化缓存目录
+    global _cache_dir
+    if args.cache_dir and args.cache_dir.strip():
+        _cache_dir = os.path.abspath(args.cache_dir)
+        os.makedirs(_cache_dir, exist_ok=True)
+        log.info(f"PCM 缓存目录: {_cache_dir}")
+    else:
+        _cache_dir = None
+        log.info("PCM 缓存已禁用")
 
     asyncio.run(main(args))
