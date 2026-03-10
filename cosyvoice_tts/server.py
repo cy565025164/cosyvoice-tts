@@ -71,6 +71,8 @@ import argparse
 import time
 import uuid
 import threading
+import re
+import struct
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -169,6 +171,52 @@ def speech_to_pcm_bytes(tts_speech: torch.Tensor) -> bytes:
         audio = audio / peak * 0.95
     pcm = (audio * 32767).clamp(-32768, 32767).to(torch.int16)
     return pcm.numpy().tobytes()
+
+
+# 括号匹配：全角（）和半角()
+_BRACKET_RE = re.compile(r'[（(]([^）)]*)[）)]')
+# "空x秒" 模式
+_SILENCE_RE = re.compile(r'^空(\d+(?:\.\d+)?)秒$')
+# app 替换（大小写不敏感）
+_APP_RE = re.compile(r'(?i)app')
+
+
+def _generate_silence_pcm(seconds: float, sample_rate: int) -> bytes:
+    """生成指定秒数的静音 PCM (16-bit, mono)"""
+    num_samples = int(sample_rate * seconds)
+    return b'\x00\x00' * num_samples
+
+
+def preprocess_sentence(text: str):
+    """
+    预处理句子，返回 segments 列表。
+    每个 segment 是 ('text', str) 或 ('silence', float_seconds)。
+    - （空3秒）→ ('silence', 3.0)
+    - 其他括号内容 → 删除（不合成）
+    - app/APP/App → 替换为 "A批批"
+    """
+    segments = []
+    last_end = 0
+    for m in _BRACKET_RE.finditer(text):
+        # 括号前的文本
+        before = text[last_end:m.start()]
+        if before.strip():
+            segments.append(('text', _APP_RE.sub('A批批', before)))
+        # 括号内容
+        inner = m.group(1).strip()
+        sm = _SILENCE_RE.match(inner)
+        if sm:
+            segments.append(('silence', float(sm.group(1))))
+        # 其他括号内容：忽略（不合成）
+        last_end = m.end()
+    # 剩余文本
+    remaining = text[last_end:]
+    if remaining.strip():
+        segments.append(('text', _APP_RE.sub('A批批', remaining)))
+    # 如果没有括号，整句做 app 替换
+    if not segments and text.strip():
+        segments.append(('text', _APP_RE.sub('A批批', text)))
+    return segments
 
 
 # ============================================================
@@ -595,22 +643,31 @@ async def _synth_worker(ws, conn_id, session: SynthSession):
 
             t0 = time.time()
             try:
-                async with _infer_semaphore:
-                    results = await loop.run_in_executor(
-                        _executor,
-                        do_inference,
-                        sentence, session.mode,
-                        session.prompt_text, session.prompt_wav,
-                        session.speaker_id, session.instruct_text,
-                        True,
-                    )
-
-                for r in results:
+                segments = preprocess_sentence(sentence)
+                for seg_type, seg_value in segments:
                     if session.cancel_event.is_set():
                         break
-                    pcm = speech_to_pcm_bytes(r['tts_speech'])
-                    await ws.send(pcm)
-                    chunks += 1
+                    if seg_type == 'silence':
+                        silence_pcm = _generate_silence_pcm(
+                            seg_value, _model.sample_rate)
+                        await ws.send(silence_pcm)
+                        chunks += 1
+                    elif seg_type == 'text' and seg_value.strip():
+                        async with _infer_semaphore:
+                            results = await loop.run_in_executor(
+                                _executor,
+                                do_inference,
+                                seg_value, session.mode,
+                                session.prompt_text, session.prompt_wav,
+                                session.speaker_id, session.instruct_text,
+                                True,
+                            )
+                        for r in results:
+                            if session.cancel_event.is_set():
+                                break
+                            pcm = speech_to_pcm_bytes(r['tts_speech'])
+                            await ws.send(pcm)
+                            chunks += 1
 
                 _stats["total_sentences"] += 1
                 log.debug(f"[{conn_id}/{session.session_id}] "
